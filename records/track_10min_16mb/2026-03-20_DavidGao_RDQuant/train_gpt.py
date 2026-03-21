@@ -1169,7 +1169,9 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    use_compile = bool(int(os.environ.get("COMPILE", "1")))
+    if use_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1274,7 +1276,10 @@ def main() -> None:
     _QAT_QUANT_BITS = args.quant_bits
     restore_low_dim_params_to_fp32(base_model)
     log0(f"qat:{args.qat} quant_bits:{args.quant_bits}")
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if use_compile:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
