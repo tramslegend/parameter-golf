@@ -764,57 +764,73 @@ class DiffAttention(nn.Module):
 
 
 class DGAttention(nn.Module):
-    """David's D/G concept: replace QKV with Designator/Gradient projections.
+    """David's D/G v2: Designator/Gradient attention with fixes from review.
 
-    D (Designator): compressed token fingerprint for matching. Instead of
-    full Q/K dot product, tokens match via element-wise comparison of small
-    designator vectors. Much cheaper than matrix multiply.
-
-    G (Gradient): tracks token-to-token differences. Instead of V passing
-    raw content, G passes the delta between tokens — what's NEW about this
-    token relative to context. Like differential coding for attention.
-
-    The math: score = sum(D_i * D_j) for matching (like attention but smaller),
-    output = sum(score * G_j) where G_j = x_j - running_mean(x).
+    Fixes applied:
+    1. Asymmetric D: separate D_q and D_k (narrower than Q/K but not symmetric)
+    2. EMA baseline instead of running mean (decays old context, keeps recent)
+    3. Hybrid payload: learned mix of raw content + differential novelty
+       G = W_g(x - alpha*ema) + beta*W_v(x)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        # D: designator — compressed fingerprint (half the dim of standard Q/K)
+        # Asymmetric D: separate query/key designators (narrower than standard Q/K)
         d_dim = dim // 2
         self.d_head_dim = d_dim // num_heads
-        self.c_d = CastedLinear(dim, d_dim, bias=False)
-        # G: gradient — what's new about this token
-        self.c_g = CastedLinear(dim, dim, bias=False)
+        self.c_dq = CastedLinear(dim, d_dim, bias=False)
+        self.c_dk = CastedLinear(dim, d_dim, bias=False)
+        # Hybrid payload: differential + raw content
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_g = CastedLinear(dim, kv_dim, bias=False)  # differential channel
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)  # raw content channel
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # Learned mixing: how much differential vs raw per head
+        self.alpha = nn.Parameter(torch.tensor(0.9, dtype=torch.float32))  # EMA decay
+        self.beta = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))   # raw vs diff mix
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.d_head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        # D: compressed designator for matching
-        d = self.c_d(x).reshape(bsz, seqlen, self.num_heads, self.d_head_dim).transpose(1, 2)
-        d = F.rms_norm(d, (d.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, d.dtype)
-        d = apply_rotary_emb(d, cos, sin)
-        # G: gradient — token's unique contribution (x minus causal running mean)
-        cumsum = torch.cumsum(x, dim=1)
-        counts = torch.arange(1, seqlen + 1, device=x.device, dtype=x.dtype)[None, :, None]
-        running_mean = cumsum / counts
-        g = self.c_g(x - running_mean)
-        g = g.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        # Matching via D (cheaper than full QK — half dim)
-        scores = torch.matmul(d, d.transpose(-2, -1)) / (self.d_head_dim ** 0.5)
-        # Causal mask
+        # Asymmetric designators for matching
+        dq = self.c_dq(x).reshape(bsz, seqlen, self.num_heads, self.d_head_dim).transpose(1, 2)
+        dk = self.c_dk(x).reshape(bsz, seqlen, self.num_kv_heads, self.d_head_dim).transpose(1, 2)
+        dq = F.rms_norm(dq, (dq.size(-1),))
+        dk = F.rms_norm(dk, (dk.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, dq.dtype)
+        dq = apply_rotary_emb(dq, cos, sin)
+        dk = apply_rotary_emb(dk, cos, sin)
+        dq = dq * self.q_gain.to(dtype=dq.dtype)[None, :, None, None]
+        # EMA baseline (exponential moving average, not global mean)
+        alpha = torch.sigmoid(self.alpha).to(dtype=x.dtype)
+        ema = torch.zeros_like(x[:, :1, :])
+        ema_list = [ema]
+        for t in range(1, seqlen):
+            ema = alpha * ema + (1 - alpha) * x[:, t-1:t, :]
+            ema_list.append(ema)
+        ema_baseline = torch.cat(ema_list, dim=1)
+        # Hybrid payload: mix differential novelty with raw content
+        mix = torch.sigmoid(self.beta)
+        diff_signal = self.c_g(x - ema_baseline)
+        raw_signal = self.c_v(x)
+        payload = (1 - mix) * diff_signal + mix * raw_signal
+        payload = payload.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Attention via asymmetric designators
+        n_rep = self.num_heads // self.num_kv_heads
+        if n_rep > 1:
+            dk = dk.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.d_head_dim)
+            payload = payload.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
+        scores = torch.matmul(dq, dk.transpose(-2, -1)) / (self.d_head_dim ** 0.5)
         mask = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(mask[None, None, :, :], float('-inf'))
         attn = torch.softmax(scores, dim=-1)
-        # Aggregate gradients weighted by designator match
-        y = torch.matmul(attn, g)
+        y = torch.matmul(attn, payload)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y) * self.scale.to(dtype=y.dtype)[None, None, :]
+        return self.proj(y)
 
 
 class SharedKVAttention(nn.Module):
