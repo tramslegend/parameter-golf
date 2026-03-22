@@ -664,8 +664,9 @@ class CausalSelfAttention(nn.Module):
 
 
 class PolyAttention(nn.Module):
-    """Replace softmax with polynomial: attn = (1 + QK^T/d)^2.
-    O(n) via kernel trick for degree-2 polynomials. No softmax, no sqrt(d)."""
+    """Replace softmax with cubic polynomial: attn = (score / learned_scale)^3.
+    Based on arXiv 2410.18613. Key: must scale by 1/sqrt(N) and use learnable scaling.
+    Cubic outperforms quadratic. Dynamic scaling outperforms fixed."""
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.num_heads = num_heads
@@ -679,6 +680,8 @@ class PolyAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        # Learnable dynamic scale, initialized to 1/sqrt(seq_len) ~ 1/sqrt(1024) ~ 0.031
+        self.attn_scale = nn.Parameter(torch.tensor(0.031, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -695,16 +698,16 @@ class PolyAttention(nn.Module):
         if n_rep > 1:
             k = k.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
             v = v.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
-        # Polynomial attention: (1 + QK^T/d)^2 with causal mask
-        scale = 1.0 / self.head_dim
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # Cubic polynomial attention with dynamic scaling
+        raw_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         # Causal mask
         mask = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask[None, None, :, :], -1.0)
-        # Polynomial: (1 + score)^2 — no softmax
-        attn = (1.0 + scores).square()
+        raw_scores = raw_scores.masked_fill(mask[None, None, :, :], 0.0)
+        # Cubic: (score * scale)^3 with learned scale
+        scale = self.attn_scale.to(dtype=raw_scores.dtype)
+        attn = (raw_scores * scale).pow(3)
         attn = attn.masked_fill(mask[None, None, :, :], 0.0)
-        # Normalize rows so they sum to 1
+        # Row normalize
         attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
         y = torch.matmul(attn, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
