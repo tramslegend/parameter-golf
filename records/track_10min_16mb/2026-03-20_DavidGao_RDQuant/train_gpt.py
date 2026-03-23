@@ -791,6 +791,7 @@ class DGAttention(nn.Module):
         self.proj._zero_init = True
         # Learned mixing: how much differential vs raw per head
         self.beta = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))   # raw vs diff mix
+        self.gamma = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))  # local vs global baseline
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.d_head_dim, base=rope_base)
 
@@ -805,12 +806,16 @@ class DGAttention(nn.Module):
         dq = apply_rotary_emb(dq, cos, sin)
         dk = apply_rotary_emb(dk, cos, sin)
         dq = dq * self.q_gain.to(dtype=dq.dtype)[None, :, None, None]
-        # Causal mean baseline via parallel cumsum (no sequential loop)
+        # Blended baseline: local (previous token) + global (cumsum mean)
+        # Like video compression: diff against previous frame, not average of all frames
+        prev_token = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         prefix = x.cumsum(dim=1)
         counts = torch.arange(1, seqlen + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
         mean_inclusive = prefix / counts
-        # Shift right: baseline at position t = mean of positions 0..t-1
-        baseline = torch.cat([torch.zeros_like(mean_inclusive[:, :1]), mean_inclusive[:, :-1]], dim=1)
+        global_mean = torch.cat([torch.zeros_like(mean_inclusive[:, :1]), mean_inclusive[:, :-1]], dim=1)
+        # Learned blend: γ controls local vs global emphasis
+        g = torch.sigmoid(self.gamma.to(dtype=x.dtype))
+        baseline = g * prev_token + (1 - g) * global_mean
         # Hybrid payload: mix differential novelty with raw content
         mix = torch.sigmoid(self.beta)
         diff_signal = self.c_g(x - baseline)
