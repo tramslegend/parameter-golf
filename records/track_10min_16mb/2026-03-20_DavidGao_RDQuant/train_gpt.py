@@ -785,25 +785,27 @@ class DGAttention(nn.Module):
     3. Hybrid payload: learned mix of raw content + differential novelty
        G = W_g(x - alpha*ema) + beta*W_v(x)
     """
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float,
+                 layer_idx: int = 0, num_layers: int = 11):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        # Depth schedule: early layers use raw content, deep layers use differential
+        # Based on empirical β trajectory from both 5080 and H100 runs
+        self.raw_mix = 1.0 - (layer_idx / max(num_layers - 1, 1))  # L0=1.0(raw), L_last=0.0(diff)
         # Asymmetric D: separate query/key designators (same dim as payload for Flash Attention)
         self.d_head_dim = self.head_dim  # match payload dim for SDPA compatibility
         d_dim = self.num_heads * self.d_head_dim
         dk_dim = self.num_kv_heads * self.d_head_dim
         self.c_dq = CastedLinear(dim, d_dim, bias=False)
         self.c_dk = CastedLinear(dim, dk_dim, bias=False)
-        # Hybrid payload: differential + raw content
+        # Hybrid payload: differential + raw content, depth-scheduled mix
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_g = CastedLinear(dim, kv_dim, bias=False)  # differential channel
         self.c_v = CastedLinear(dim, kv_dim, bias=False)  # raw content channel
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        # Learned mixing: how much differential vs raw per head
-        self.beta = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))   # raw vs diff mix
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.d_head_dim, base=rope_base)
 
@@ -823,11 +825,10 @@ class DGAttention(nn.Module):
         counts = torch.arange(1, seqlen + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
         mean_inclusive = prefix / counts
         baseline = torch.cat([torch.zeros_like(mean_inclusive[:, :1]), mean_inclusive[:, :-1]], dim=1)
-        # Hybrid payload: mix differential novelty with raw content
-        mix = torch.sigmoid(self.beta)
+        # Depth-scheduled payload: early layers raw, deep layers differential
         diff_signal = self.c_g(x - baseline)
         raw_signal = self.c_v(x)
-        payload = (1 - mix) * diff_signal + mix * raw_signal
+        payload = self.raw_mix * raw_signal + (1.0 - self.raw_mix) * diff_signal
         payload = payload.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # Attention via asymmetric designators — use Flash Attention when available
         n_rep = self.num_heads // self.num_kv_heads
@@ -1106,7 +1107,8 @@ class BigramHashEmbedding(nn.Module):
 
 
 def build_attention(variant: str, dim: int, num_heads: int, num_kv_heads: int,
-                    rope_base: float, qk_gain_init: float, latent_kv_dim: int = 64):
+                    rope_base: float, qk_gain_init: float, latent_kv_dim: int = 64,
+                    layer_idx: int = 0, num_layers: int = 11):
     """Factory for attention variants."""
     if variant == "shared_kv":
         return SharedKVAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -1119,7 +1121,8 @@ def build_attention(variant: str, dim: int, num_heads: int, num_kv_heads: int,
     elif variant == "diff":
         return DiffAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
     elif variant == "dg":
-        return DGAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        return DGAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                          layer_idx=layer_idx, num_layers=num_layers)
     else:
         return CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
 
@@ -1127,11 +1130,12 @@ def build_attention(variant: str, dim: int, num_heads: int, num_kv_heads: int,
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, attn_variant: str = "standard",
-                 latent_kv_dim: int = 64):
+                 latent_kv_dim: int = 64, layer_idx: int = 0, num_layers: int = 11):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = build_attention(attn_variant, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, latent_kv_dim)
+        self.attn = build_attention(attn_variant, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, latent_kv_dim,
+                                   layer_idx=layer_idx, num_layers=num_layers)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1192,8 +1196,9 @@ class GPT(nn.Module):
         else:
             self.blocks = nn.ModuleList([
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                      attn_variant=attn_variant, latent_kv_dim=latent_kv_dim)
-                for _ in range(num_layers)
+                      attn_variant=attn_variant, latent_kv_dim=latent_kv_dim,
+                      layer_idx=i, num_layers=num_layers)
+                for i in range(num_layers)
             ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -1676,15 +1681,15 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            # Log DG gate values if using DG attention
-            if args.attn_variant == "dg" and step % (args.train_log_every * 5) == 0:
-                betas = []
+            # Log DG depth schedule if using DG attention
+            if args.attn_variant == "dg" and step == 1:
+                schedule = []
                 for i, block in enumerate(base_model.blocks):
                     attn = block.attn
-                    if hasattr(attn, 'beta'):
-                        betas.append(f"L{i}:{torch.sigmoid(attn.beta).item():.3f}")
-                if betas:
-                    log0(f"dg_beta(raw_vs_diff):[{','.join(betas)}]")
+                    if hasattr(attn, 'raw_mix'):
+                        schedule.append(f"L{i}:{attn.raw_mix:.2f}raw/{1-attn.raw_mix:.2f}diff")
+                if schedule:
+                    log0(f"dg_depth_schedule:[{','.join(schedule)}]")
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
