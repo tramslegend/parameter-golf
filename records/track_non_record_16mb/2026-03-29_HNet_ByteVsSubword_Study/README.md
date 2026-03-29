@@ -50,13 +50,13 @@ The 4-hour byte260 run (**1.3595 BPB**) surpasses the best sp1024 10-min result 
 
     Extending the same `byte260` architecture from the 10-minute budget to a **4-hour** run reduces BPB from **1.4116** to **1.3595**, suggesting that part of the remaining gap is due to optimization budget rather than a hard limit of byte-level H-Net. Even at 4 hours, BPB is still decreasing gradually.
 
-6. * The router learns to compress the sequence substantially before the main stage.**
+6. *(The router learns to compress the sequence substantially before the main stage.**
 
-  Across validation samples, training reduces the number of chunk boundaries relative to initialization significantly. For `byte260`, the router goes from roughly **~120 boundaries per 256-byte window at initialization** to about **~42–47 after training**, corresponding to an average chunk length of about **5–6 bytes**. This shows that the learned boundaries are not only interpretable (i.e., word-like), but also produce a substantial reduction in sequence length before the main transformer stage.
+    Across validation samples, training reduces the number of chunk boundaries relative to initialization significantly. For `byte260`, the router goes from roughly **~120 boundaries per 256-byte window at initialization** to about **~42–47 after training**, corresponding to an average chunk length of about **5–6 bytes**. This shows that the learned boundaries are not only interpretable (i.e., word-like), but also produce a substantial reduction in sequence length before the main transformer stage.
 
 7. **Byte-level chunking is more regular than subword-level chunking (H-Net).**
 
-  The `byte260` model consistently achieves lower chunk-size CV than `sp1024` (see Results section), indicating that its learned chunk sequence is more regular in length. Qualitatively, this matches the boundary visualizations: `byte260` tends to produce word-like chunks of similar size, while `sp1024` more often alternates between very short fragments and much longer merged spans.
+    The `byte260` model consistently achieves lower chunk-size CV than `sp1024` (see Results section), indicating that its learned chunk sequence is more regular in length. Qualitatively, this matches the boundary visualizations: `byte260` tends to produce word-like chunks of similar size, while `sp1024` more often alternates between very short fragments and much longer merged spans.
 
 
 
