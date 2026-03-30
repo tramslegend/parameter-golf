@@ -1,15 +1,14 @@
 # [Non-record] 1-Stage Byte-level H-Net at 17.5M: Dynamic Chunking Learns Whitespace-Aligned Boundaries (39x-91x smaller than the H-Net paper)
 
-This non-record submission studies how H-Net's dynamic chunking compares on **raw bytes (`byte260`)** or vs **pre-tokenized subwords (`sp1024`)**, using the same 1-stage 9-layer H-Net backbone and the challenge’s tokenizer-agnostic **BPB** metric.
+In this non-record submission I study how H-Net's dynamic chunking compares on **raw bytes (`byte260`)** vs **pre-tokenized subwords (`sp1024`)**, using the same 1-stage 9-layer H-Net backbone.
 
-The best artifact-eligible `byte260` run reaches **1.4116 ± 0.013 BPB** at **15.78 MB** in the 10-minute setting on **8×H100**, while a 4-hour extended run reaches **1.3595 BPB**. Across **20 matched runs** over 4 hyperparameter axes, the byte-level model learns **whitespace-aligned, word-like boundaries** directly from raw bytes, while the subword-level model shows a different chunking pattern over already-tokenized inputs.
+The best `byte260` run reaches **1.4116 ± 0.013 BPB** at **15.78 MB** in the 10-minute setting on **8×H100**, while a 4-hour extended run reaches **1.3595 BPB**. Across **20 matched runs** over 4 hyperparameters, the byte-level model learns **whitespace-aligned, word-like boundaries** directly from raw bytes. At the same time, the subword-level (`sp1024`) model shows a different chunking pattern over already-tokenized inputs.
 
 This submission also adds:
 - a matched `byte260` vs `sp1024` ablation study
 - quantitative boundary metrics (whitespace agreement, chunk-size coefficient of variation)
 - qualitative boundary visualizations
-- a working multi-GPU DDP training path for padded chunk sequences.
-
+- a working multi-GPU DDP training ( using padded chunk sequences).
 
 ## Key Results (≤16MB)
 
@@ -27,38 +26,29 @@ The 4-hour byte260 run (**1.3595 BPB**) surpasses the best sp1024 10-min result 
 ## Findings
 
 
-1. **Byte-level H-Net is competitive with subword-level H-Net at small scale.**
+1. **Byte-level H-Net gets close to subword-level H-Net performance at small scale, within 10 mins.**
 
-    Our byte260 H-Net reaches **1.4116 BPB** in the 10-minute setting, improving substantially over the earlier byte-level H-Net (1.90, 22M params [PR #1044](https://github.com/openai/parameter-golf/pull/1044)) result and landing close to our best sp1024 subword-level H-Net run.
+    Our byte260 H-Net reaches **1.4116 ± 0.013 BPB** in the 10-minute setting. This is a significant improvement over the previous byte-level H-Net (1.90 BPB, 22M params [PR #1044](https://github.com/openai/parameter-golf/pull/1044)) result and landing close to our best sp1024 subword-level H-Net run (1.3734 BPB).
 
-
-2. **Byte-level H-Net benefits from deeper chunking/dechunking interfaces.**
-
-     Moving from `OUTER_LAYERS=1` to `OUTER_LAYERS=2` improves BPB for `byte260`, matching the finding reported in earlier H-Net work for subword-level H-Net ([PR #992](https://github.com/openai/parameter-golf/pull/992)): capacity around the encoder/chunker/decoder interface matters more than putting depth only into the compressed main 'stage'.
-
-
-3. **The ratio loss changes segmentation quality, not just chunk counts.**
-
-     Increasing `RATIO_LOSS_WEIGHT` (RLW) improves `byte260` BPB and whitespace alignment, which suggests the auxiliary loss helps the routing module discover more human-language-like boundaries rather than only matching a target chunk ratio.
-
-
-4. **Byte-level H-Net learns whitespace-aligned segmentation from raw bytes without an external tokenizer.**
+2. **Byte-level H-Net learns whitespace-aligned segmentation from raw bytes without an external tokenizer.**
 
      In some of the artifact-eligible `byte260` runs, predicted boundaries align with whitespace over **97%** of the time. This shows that dynamic chunking can recover linguistically meaningful segmentation structure (i.e., word-like in this case) directly from bytes (see Qualitative Boundary Analysis section).
 
-5. **The byte model still has clear optimization headroom.**
+3. **The byte H-Net still has clear optimization headroom.**
 
     Extending the same `byte260` architecture from the 10-minute budget to a **4-hour** run reduces BPB from **1.4116** to **1.3595**, suggesting that part of the remaining gap is due to optimization budget rather than a hard limit of byte-level H-Net. Even at 4 hours, BPB is still decreasing gradually.
 
-6. *(The router learns to compress the sequence substantially before the main stage.**
+4. **The router learns to compress the sequence substantially before the main stage.**
 
-    Across validation samples, training reduces the number of chunk boundaries relative to initialization significantly. For `byte260`, the router goes from roughly **~120 boundaries per 256-byte window at initialization** to about **~42–47 after training**, corresponding to an average chunk length of about **5–6 bytes**. This shows that the learned boundaries are not only interpretable (i.e., word-like), but also produce a substantial reduction in sequence length before the main transformer stage.
+     Across validation samples, training reduces the number of chunk boundaries relative to initialization significantly. For `byte260`, the router goes from roughly **~120 boundaries per 256-byte window at initialization** to about **~42–47 after training**, corresponding to an average chunk length of about **5–6 bytes**. This shows that the learned boundaries are not only interpretable (i.e., word-like), but also produce a substantial reduction in sequence length before the main transformer stage.
 
-7. **Byte-level chunking is more regular than subword-level chunking (H-Net).**
+5. **Byte-level chunking is more regular than subword-level chunking (H-Net).**
 
-    The `byte260` model consistently achieves lower chunk-size CV than `sp1024` (see Results section), indicating that its learned chunk sequence is more regular in length. Qualitatively, this matches the boundary visualizations: `byte260` tends to produce word-like chunks of similar size, while `sp1024` more often alternates between very short fragments and much longer merged spans.
+     The `byte260` model consistently achieves lower chunk-size CV than `sp1024` (see Results section), which indicates that its learned chunk sequence is more regular in length. Qualitatively, this matches the boundary visualizations: `byte260` tends to produce word-like chunks of similar size, while `sp1024` more often alternates between very short fragments and much longer merged spans.
 
+6. **Byte-level H-Net benefits from deeper chunking/dechunking interfaces.**
 
+     Moving from `OUTER_LAYERS=1` to `OUTER_LAYERS=2` improves BPB for `byte260`, matching the finding reported in earlier H-Net work for subword-level H-Net ([PR #992](https://github.com/openai/parameter-golf/pull/992)): capacity around the encoder/chunker/decoder interface matters more than putting depth only into the compressed main 'stage'.
 
 
 ## Architecture
@@ -131,8 +121,6 @@ The routing module predicts chunk boundaries from adjacent encoder hidden states
 | 0.05 | byte260 | **1.4032** | 15.78 | Yes | **95.4%** | 0.45 |
 | 0.05 | sp1024 | 1.3697 | 16.14 | No | — | 0.72 |
 
-- A slightly higher RLW (`0.05`) helps `byte260` both quantitatively (BPB) and qualitatively (whitespace alignment), while not helping `sp1024`.
-
 
 ### Ablation 4: HNET_LR_DIFF (OL2, chunk=9, rlw=0.03)
 
@@ -171,7 +159,7 @@ Boundaries generated from **byte260** best 10-min config (RLW=0.05, chunk=9, OL=
 [The][quick brown f][ox j][umps over the lazy dog. N][atural l][anguage processing has made remarkable progress in recent years.]
 ```
 
-The sp1024 H-Net creates fewer, larger chunks with uneven sizes, isolating short prefixes (`[The]`) and merging entire clauses into single chunks. The boundaries don't align with word edges because the SentencePiece tokenizer already fragmented words into subwords.
+The sp1024 H-Net creates fewer, larger chunks with uneven sizes, isolating short prefixes (`[The]`) and merging entire clauses into single chunks. The boundaries don't align with words.
 
 ### Validation sample (byte260, trained)
 
@@ -201,16 +189,14 @@ byte260 4-hour checkpoint (RLW=0.03, chunk=9, OL=2, KV=4, 85k steps, 1.3595 BPB)
 [Insurance][ Company][ ][Declares][ ][Living][ ][Man][ ][Dead][ ][George][ ][Johannesen][ is][ ][very][ ][much][ alive][. Which][ is][ why][ it][ was][ ][so][ ][surprising][ when][ the][ Canadian][ ][man][ ][received][ a][ ][letter][ was][ to]
 ```
 
-- With more training (85k steps vs ~4.5k@10 mins), the model shifts how it handles whitespace. Spaces get their own 1-byte chunks (often) or attach to the following word (sometimes) instead of the preceding one. The boundaries are still word-aligned, but organized differently.
+- With more training (85k steps vs ~4.5k@10 mins), the model handles whitespaces differently. Spaces get their own 1-byte chunks (often) or attach to the following word (sometimes) instead of the preceding one. The boundaries are still word-aligned.
 
 
 ## Comparison with Existing H-Net PRs
 
-- The two earlier H-Net PRs did not present a working multi-GPU DDP training path. [PR #992](https://github.com/openai/parameter-golf/pull/992) reports a *simulated* 8×H100 result and mentions DDP / multi-GPU training as WIP, while [PR #1044](https://github.com/openai/parameter-golf/pull/1044) was trained on a single RTX 4090. This implementation runs with working DDP on 8×H100 by padding the compressed chunk sequence and using a combined causal + padding attention mask.
+- The two previous H-Net PRs did not present a working multi-GPU DDP training path. [PR #992](https://github.com/openai/parameter-golf/pull/992) reports a *simulated* 8×H100 result and mentions multi-GPU training as WIP. [PR #1044](https://github.com/openai/parameter-golf/pull/1044) was trained on a single RTX 4090. This implementation runs with working DDP on 8×H100 by padding the compressed chunk sequence and using a combined causal + padding attention mask.
 
-
-- [PR #1044](https://github.com/openai/parameter-golf/pull/1044) uses causal depthwise Conv1d for the encoder/decoder, while both [PR #992](https://github.com/openai/parameter-golf/pull/992) and this submission use full transformer blocks. At 22M parameters and 1.8989 BPB, [PR #1044](https://github.com/openai/parameter-golf/pull/1044) established byte-level H-Net as a tiny-scale proof of concept, but the BPB is significantly higher than the best results reported here.
-
+- [PR #1044](https://github.com/openai/parameter-golf/pull/1044) uses causal depthwise Conv1d for the encoder/decoder, while both [PR #992](https://github.com/openai/parameter-golf/pull/992) and this submission use full transformer blocks. At 22M parameters and 1.8989 BPB, [PR #1044](https://github.com/openai/parameter-golf/pull/1044) showed a tiny-scale proof of concept for byte-level H-Net, but the BPB is significantly higher than the best results reported here.
 
 - Neither existing PRs focused on a matched comparison between byte-level and subword-level H-Net, or on quantitative boundary analysis. This submission adds 20 matched runs across four hyperparameter axes together with boundary metrics (for example whitespace agreement and chunk-size CV), showing how the routing module's learned segmentation changes across settings.
 
@@ -258,6 +244,6 @@ MAX_WALLCLOCK_SECONDS=600 NUM_LAYERS=9 MODEL_DIM=512 \
 
 ## Credits
 
-- **Paper**: Nawrot et al. (2024), [*Dynamic Chunking for End-to-End Hierarchical Sequence Modeling*](https://arxiv.org/abs/2507.07955) — the H-Net architecture this submission implements. Official code: [github.com/goombalab/hnet](https://github.com/goombalab/hnet)
-- **lucidrains**: [github.com/lucidrains/h-net-dynamic-chunking](https://github.com/lucidrains/h-net-dynamic-chunking) — clean standalone reimplementation of H-Net
+- **Paper**: Hwang et al. (2025), [*Dynamic Chunking for End-to-End Hierarchical Sequence Modeling*](https://arxiv.org/abs/2507.07955) - the H-Net architecture this submission implements. Official code: [github.com/goombalab/hnet](https://github.com/goombalab/hnet)
+- **lucidrains**: [github.com/lucidrains/h-net-dynamic-chunking](https://github.com/lucidrains/h-net-dynamic-chunking) - standalone reimplementation of H-Net
 - **TimS-ml (#992)**: [github.com/TimS-ml/parameter-golf](https://github.com/TimS-ml/parameter-golf) - inspiration for some of the hyperparameters
