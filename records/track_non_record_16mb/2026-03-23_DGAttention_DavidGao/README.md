@@ -1,8 +1,23 @@
-# DG Attention: Differential-Gated Attention with Depth-Scheduled Novelty Encoding
+# DG Attention: Depth-Scheduled Differential Payloads for Language Modeling
 
-**val_bpb: 1.1898** | 2,979 steps @ 201ms/step | 8xH100 SXM, 600s
+**val_bpb: 1.1898** (initial submission) → **1.1554** (v4.1, post-quantization) | 8xH100 SXM
 
-Novel attention mechanism where deep layers transmit *what's new* about each token instead of raw content. Named "DG" for **D**esignator/**G**radient.
+Alternative attention mechanism where deep layers transmit inter-token changes instead of absolute content, with a parameter-free linear depth schedule. Named "DG" for **D**esignator/**G**uided.
+
+## Results
+
+DG Attention matches standard attention but does not definitively improve it:
+
+| Variant | val_bpb (post-quant) |
+|---------|---------------------|
+| DG Attention (v4.1) | 1.1554 |
+| Matched Standard | 1.1516 |
+
+The 0.004 BPB gap is within noise. DG does use 33% less VRAM and produces a 6% smaller artifact, but these savings don't translate to better language modeling quality at this scale.
+
+The main contribution is documenting the design trajectory: four iterations, a scale-dependent gate-collapse phenomenon, and variance ratio analysis showing DG induces steeper inter-token redundancy gradients across depth — even when aggregate BPB is unchanged.
+
+See the [full paper](../../paper/dg_attention.pdf) for details.
 
 ## Run
 
