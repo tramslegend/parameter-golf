@@ -1,4 +1,4 @@
-# Notable Non-Record Submission: {} BPB — Learned Adapters on Random Linear Maps
+# Notable Non-Record Submission: 1.2184 BPB — Learned Adapters on Random Linear Maps
 
 ## Summary
 12 transformer layers, random adapter MLPs, mixed int-6/int-8 compression, and sliding eval
